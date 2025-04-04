@@ -173,6 +173,7 @@ class TestHive(Validator):
         self.validate_identity(
             """CREATE EXTERNAL TABLE `my_table` (`a7` ARRAY<DATE>) ROW FORMAT SERDE 'a' STORED AS INPUTFORMAT 'b' OUTPUTFORMAT 'c' LOCATION 'd' TBLPROPERTIES ('e'='f')"""
         )
+        self.validate_identity("CREATE EXTERNAL TABLE X (y INT) STORED BY 'x'")
         self.validate_identity("ALTER VIEW v1 AS SELECT x, UPPER(s) AS s FROM t2")
         self.validate_identity("ALTER VIEW v1 (c1, c2) AS SELECT x, UPPER(s) AS s FROM t2")
         self.validate_identity(
@@ -336,8 +337,8 @@ class TestHive(Validator):
                 "bigquery": "FORMAT_DATE('%Y-%m-%d %H:%M:%S', CAST('2020-01-01' AS DATETIME))",
                 "duckdb": "STRFTIME(CAST('2020-01-01' AS TIMESTAMP), '%Y-%m-%d %H:%M:%S')",
                 "presto": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), '%Y-%m-%d %T')",
-                "hive": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), 'yyyy-MM-dd HH:mm:ss')",
-                "spark": "DATE_FORMAT(CAST('2020-01-01' AS TIMESTAMP), 'yyyy-MM-dd HH:mm:ss')",
+                "hive": "DATE_FORMAT('2020-01-01', 'yyyy-MM-dd HH:mm:ss')",
+                "spark": "DATE_FORMAT('2020-01-01', 'yyyy-MM-dd HH:mm:ss')",
             },
         )
         self.validate_all(
@@ -588,8 +589,8 @@ class TestHive(Validator):
         self.validate_all(
             "LOCATE('a', x, 3)",
             write={
-                "duckdb": "STRPOS(SUBSTR(x, 3), 'a') + 3 - 1",
-                "presto": "STRPOS(SUBSTR(x, 3), 'a') + 3 - 1",
+                "duckdb": "CASE WHEN STRPOS(SUBSTRING(x, 3), 'a') = 0 THEN 0 ELSE STRPOS(SUBSTRING(x, 3), 'a') + 3 - 1 END",
+                "presto": "IF(STRPOS(SUBSTRING(x, 3), 'a') = 0, 0, STRPOS(SUBSTRING(x, 3), 'a') + 3 - 1)",
                 "hive": "LOCATE('a', x, 3)",
                 "spark": "LOCATE('a', x, 3)",
             },
@@ -740,6 +741,7 @@ class TestHive(Validator):
                 "presto": "SET_AGG(x)",
                 "snowflake": "ARRAY_UNIQUE_AGG(x)",
                 "spark": "COLLECT_SET(x)",
+                "trino": "ARRAY_AGG(DISTINCT x)",
             },
         )
         self.validate_all(
@@ -757,7 +759,7 @@ class TestHive(Validator):
         self.validate_all(
             "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(b, 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(b, 'yyyy')), a)",
             write={
-                "hive": "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(CAST(b AS TIMESTAMP), 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(CAST(b AS TIMESTAMP), 'yyyy')), a)",
+                "hive": "SELECT a, SUM(c) FROM t GROUP BY a, DATE_FORMAT(b, 'yyyy'), GROUPING SETS ((a, DATE_FORMAT(b, 'yyyy')), a)",
             },
         )
         self.validate_all(
@@ -803,6 +805,23 @@ class TestHive(Validator):
                 "spark2": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
                 "spark": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
                 "databricks": "SELECT EXISTS(ARRAY(2, 3), x -> x % 2 = 0)",
+            },
+        )
+
+        self.validate_identity("SELECT 1_2")
+
+        self.validate_all(
+            "SELECT MAP(*), STRUCT(*) FROM t",
+            read={
+                "hive": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark2": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark": "SELECT MAP(*), STRUCT(*) FROM t",
+                "databricks": "SELECT MAP(*), STRUCT(*) FROM t",
+            },
+            write={
+                "spark2": "SELECT MAP(*), STRUCT(*) FROM t",
+                "spark": "SELECT MAP(*), STRUCT(*) FROM t",
+                "databricks": "SELECT MAP(*), STRUCT(*) FROM t",
             },
         )
 

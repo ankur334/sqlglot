@@ -17,6 +17,7 @@ from sqlglot.dialects.dialect import (
     min_or_least,
     build_date_delta,
     rename_func,
+    strposition_sql,
     trim_sql,
     timestrtotime_sql,
 )
@@ -108,21 +109,24 @@ def _build_formatted_time(
     exp_class: t.Type[E], full_format_mapping: t.Optional[bool] = None
 ) -> t.Callable[[t.List], E]:
     def _builder(args: t.List) -> E:
-        assert len(args) == 2
-
-        return exp_class(
-            this=exp.cast(args[1], exp.DataType.Type.DATETIME2),
-            format=exp.Literal.string(
+        fmt = seq_get(args, 0)
+        if isinstance(fmt, exp.Expression):
+            fmt = exp.Literal.string(
                 format_time(
-                    args[0].name.lower(),
+                    fmt.name.lower(),
                     (
                         {**TSQL.TIME_MAPPING, **FULL_FORMAT_TIME_MAPPING}
                         if full_format_mapping
                         else TSQL.TIME_MAPPING
                     ),
                 )
-            ),
-        )
+            )
+
+        this = seq_get(args, 1)
+        if isinstance(this, exp.Expression):
+            this = exp.cast(this, exp.DataType.Type.DATETIME2)
+
+        return exp_class(this=this, format=fmt)
 
     return _builder
 
@@ -232,7 +236,7 @@ def _build_date_delta(
         if start_date and start_date.is_number:
             # Numeric types are valid DATETIME values
             if start_date.is_int:
-                adds = DEFAULT_START_DATE + datetime.timedelta(days=int(start_date.this))
+                adds = DEFAULT_START_DATE + datetime.timedelta(days=start_date.to_py())
                 start_date = exp.Literal.string(adds.strftime("%F"))
             else:
                 # We currently don't handle float values, i.e. they're not converted to equivalent DATETIMEs.
@@ -368,6 +372,16 @@ def _timestrtotime_sql(self: TSQL.Generator, expression: exp.TimeStrToTime):
         # If you dont have AT TIME ZONE 'UTC', wrapping that expression in another cast back to DATETIME2 just drops the timezone information
         return self.sql(exp.AtTimeZone(this=sql, zone=exp.Literal.string("UTC")))
     return sql
+
+
+def _build_datetrunc(args: t.List) -> exp.TimestampTrunc:
+    unit = seq_get(args, 0)
+    this = seq_get(args, 1)
+
+    if this and this.is_string:
+        this = exp.cast(this, exp.DataType.Type.DATETIME2)
+
+    return exp.TimestampTrunc(this=this, unit=unit)
 
 
 class TSQL(Dialect):
@@ -514,7 +528,7 @@ class TSQL(Dialect):
             "TOP": TokenType.TOP,
             "TIMESTAMP": TokenType.ROWVERSION,
             "TINYINT": TokenType.UTINYINT,
-            "UNIQUEIDENTIFIER": TokenType.UNIQUEIDENTIFIER,
+            "UNIQUEIDENTIFIER": TokenType.UUID,
             "UPDATE STATISTICS": TokenType.COMMAND,
             "XML": TokenType.XML,
         }
@@ -533,6 +547,13 @@ class TSQL(Dialect):
             **parser.Parser.QUERY_MODIFIER_PARSERS,
             TokenType.OPTION: lambda self: ("options", self._parse_options()),
         }
+
+        # T-SQL does not allow BEGIN to be used as an identifier
+        ID_VAR_TOKENS = parser.Parser.ID_VAR_TOKENS - {TokenType.BEGIN}
+        ALIAS_TOKENS = parser.Parser.ALIAS_TOKENS - {TokenType.BEGIN}
+        TABLE_ALIAS_TOKENS = parser.Parser.TABLE_ALIAS_TOKENS - {TokenType.BEGIN}
+        COMMENT_TABLE_ALIAS_TOKENS = parser.Parser.COMMENT_TABLE_ALIAS_TOKENS - {TokenType.BEGIN}
+        UPDATE_ALIAS_TOKENS = parser.Parser.UPDATE_ALIAS_TOKENS - {TokenType.BEGIN}
 
         FUNCTIONS = {
             **parser.Parser.FUNCTIONS,
@@ -561,15 +582,18 @@ class TSQL(Dialect):
             "JSON_VALUE": parser.build_extract_json_with_path(exp.JSONExtractScalar),
             "LEN": _build_with_arg_as_text(exp.Length),
             "LEFT": _build_with_arg_as_text(exp.Left),
+            "NEWID": exp.Uuid.from_arg_list,
             "RIGHT": _build_with_arg_as_text(exp.Right),
             "PARSENAME": _build_parsename,
             "REPLICATE": exp.Repeat.from_arg_list,
+            "SCHEMA_NAME": exp.CurrentSchema.from_arg_list,
             "SQUARE": lambda args: exp.Pow(this=seq_get(args, 0), expression=exp.Literal.number(2)),
             "SYSDATETIME": exp.CurrentTimestamp.from_arg_list,
             "SUSER_NAME": exp.CurrentUser.from_arg_list,
             "SUSER_SNAME": exp.CurrentUser.from_arg_list,
             "SYSTEM_USER": exp.CurrentUser.from_arg_list,
             "TIMEFROMPARTS": _build_timefromparts,
+            "DATETRUNC": _build_datetrunc,
         }
 
         JOIN_HINTS = {"LOOP", "HASH", "MERGE", "REMOTE"}
@@ -577,6 +601,8 @@ class TSQL(Dialect):
         PROCEDURE_OPTIONS = dict.fromkeys(
             ("ENCRYPTION", "RECOMPILE", "SCHEMABINDING", "NATIVE_COMPILATION", "EXECUTE"), tuple()
         )
+
+        COLUMN_DEFINITION_MODES = {"OUT", "OUTPUT", "READ_ONLY"}
 
         RETURNS_TABLE_TOKENS = parser.Parser.ID_VAR_TOKENS - {
             TokenType.TABLE,
@@ -609,6 +635,15 @@ class TSQL(Dialect):
             if isinstance(to, exp.DataType) and to.this != exp.DataType.Type.USERDEFINED
             else self.expression(exp.ScopeResolution, this=this, expression=to),
         }
+
+        def _parse_wrapped_select(self, table: bool = False) -> t.Optional[exp.Expression]:
+            if self._match(TokenType.MERGE):
+                comments = self._prev_comments
+                merge = self._parse_merge()
+                merge.add_comments(comments, prepend=True)
+                return merge
+
+            return super()._parse_wrapped_select(table=table)
 
         def _parse_dcolon(self) -> t.Optional[exp.Expression]:
             # We want to use _parse_types() if the first token after :: is a known type,
@@ -716,6 +751,18 @@ class TSQL(Dialect):
             convert.set("strict", strict)
             return convert
 
+        def _parse_column_def(
+            self, this: t.Optional[exp.Expression], computed_column: bool = True
+        ) -> t.Optional[exp.Expression]:
+            this = super()._parse_column_def(this=this, computed_column=computed_column)
+            if not this:
+                return None
+            if self._match(TokenType.EQ):
+                this.set("default", self._parse_disjunction())
+            if self._match_texts(self.COLUMN_DEFINITION_MODES):
+                this.set("output", self._prev.text)
+            return this
+
         def _parse_user_defined_function(
             self, kind: t.Optional[TokenType] = None
         ) -> t.Optional[exp.Expression]:
@@ -734,6 +781,18 @@ class TSQL(Dialect):
                 expressions = None
 
             return self.expression(exp.UserDefinedFunction, this=this, expressions=expressions)
+
+        def _parse_into(self) -> t.Optional[exp.Into]:
+            into = super()._parse_into()
+
+            table = isinstance(into, exp.Into) and into.find(exp.Table)
+            if isinstance(table, exp.Table):
+                table_identifier = table.this
+                if table_identifier.args.get("temporary"):
+                    # Promote the temporary property from the Identifier to the Into expression
+                    t.cast(exp.Into, into).set("temporary", True)
+
+            return into
 
         def _parse_id_var(
             self,
@@ -757,7 +816,7 @@ class TSQL(Dialect):
 
             if isinstance(create, exp.Create):
                 table = create.this.this if isinstance(create.this, exp.Schema) else create.this
-                if isinstance(table, exp.Table) and table.this.args.get("temporary"):
+                if isinstance(table, exp.Table) and table.this and table.this.args.get("temporary"):
                     if not create.args.get("properties"):
                         create.set("properties", exp.Properties(expressions=[]))
 
@@ -880,10 +939,12 @@ class TSQL(Dialect):
             exp.DataType.Type.ROWVERSION: "ROWVERSION",
             exp.DataType.Type.TEXT: "VARCHAR(MAX)",
             exp.DataType.Type.TIMESTAMP: "DATETIME2",
+            exp.DataType.Type.TIMESTAMPNTZ: "DATETIME2",
             exp.DataType.Type.TIMESTAMPTZ: "DATETIMEOFFSET",
             exp.DataType.Type.SMALLDATETIME: "SMALLDATETIME",
             exp.DataType.Type.UTINYINT: "TINYINT",
             exp.DataType.Type.VARIANT: "SQL_VARIANT",
+            exp.DataType.Type.UUID: "UNIQUEIDENTIFIER",
         }
 
         TYPE_MAPPING.pop(exp.DataType.Type.NCHAR)
@@ -894,6 +955,7 @@ class TSQL(Dialect):
             exp.AnyValue: any_value_to_max_sql,
             exp.ArrayToString: rename_func("STRING_AGG"),
             exp.AutoIncrementColumnConstraint: lambda *_: "IDENTITY",
+            exp.Chr: rename_func("CHAR"),
             exp.DateAdd: date_delta_sql("DATEADD"),
             exp.DateDiff: date_delta_sql("DATEDIFF"),
             exp.CTE: transforms.preprocess([qualify_derived_table_outputs]),
@@ -913,6 +975,7 @@ class TSQL(Dialect):
             exp.Min: min_or_least,
             exp.NumberToStr: _format_sql,
             exp.Repeat: rename_func("REPLICATE"),
+            exp.CurrentSchema: rename_func("SCHEMA_NAME"),
             exp.Select: transforms.preprocess(
                 [
                     transforms.eliminate_distinct_on,
@@ -922,8 +985,8 @@ class TSQL(Dialect):
                 ]
             ),
             exp.Stddev: rename_func("STDEV"),
-            exp.StrPosition: lambda self, e: self.func(
-                "CHARINDEX", e.args.get("substr"), e.this, e.args.get("position")
+            exp.StrPosition: lambda self, e: strposition_sql(
+                self, e, func_name="CHARINDEX", supports_position=True
             ),
             exp.Subquery: transforms.preprocess([qualify_derived_table_outputs]),
             exp.SHA: lambda self, e: self.func("HASHBYTES", exp.Literal.string("SHA1"), e.this),
@@ -936,6 +999,9 @@ class TSQL(Dialect):
             exp.Trim: trim_sql,
             exp.TsOrDsAdd: date_delta_sql("DATEADD", cast=True),
             exp.TsOrDsDiff: date_delta_sql("DATEDIFF"),
+            exp.TimestampTrunc: lambda self, e: self.func("DATETRUNC", e.unit, e.this),
+            exp.Uuid: lambda *_: "NEWID()",
+            exp.DateFromParts: rename_func("DATEFROMPARTS"),
         }
 
         TRANSFORMS.pop(exp.ReturnsProperty)
@@ -949,14 +1015,22 @@ class TSQL(Dialect):
             return f"{scope_name}::{rhs}"
 
         def select_sql(self, expression: exp.Select) -> str:
-            if expression.args.get("offset"):
+            limit = expression.args.get("limit")
+            offset = expression.args.get("offset")
+
+            if isinstance(limit, exp.Fetch) and not offset:
+                # Dialects like Oracle can FETCH directly from a row set but
+                # T-SQL requires an ORDER BY + OFFSET clause in order to FETCH
+                offset = exp.Offset(expression=exp.Literal.number(0))
+                expression.set("offset", offset)
+
+            if offset:
                 if not expression.args.get("order"):
                     # ORDER BY is required in order to use OFFSET in a query, so we use
                     # a noop order by, since we don't really care about the order.
                     # See: https://www.microsoftpressstore.com/articles/article.aspx?p=2314819
                     expression.order_by(exp.select(exp.null()).subquery(), copy=False)
 
-                limit = expression.args.get("limit")
                 if isinstance(limit, exp.Limit):
                     # TOP and OFFSET can't be combined, we need use FETCH instead of TOP
                     # we replace here because otherwise TOP would be generated in select_sql
@@ -1100,8 +1174,11 @@ class TSQL(Dialect):
                 if isinstance(ctas_expression, exp.UNWRAPPED_QUERIES):
                     ctas_expression = ctas_expression.subquery()
 
+                properties = expression.args.get("properties") or exp.Properties()
+                is_temp = any(isinstance(p, exp.TemporaryProperty) for p in properties.expressions)
+
                 select_into = exp.select("*").from_(exp.alias_(ctas_expression, "temp", table=True))
-                select_into.set("into", exp.Into(this=table))
+                select_into.set("into", exp.Into(this=table, temporary=is_temp))
 
                 if like_property:
                     select_into.limit(0, copy=False)
@@ -1129,6 +1206,16 @@ class TSQL(Dialect):
                 sql = sql.replace("CREATE OR REPLACE ", "CREATE OR ALTER ", 1)
 
             return self.prepend_ctes(expression, sql)
+
+        @generator.unsupported_args("unlogged", "expressions")
+        def into_sql(self, expression: exp.Into) -> str:
+            if expression.args.get("temporary"):
+                # If the Into expression has a temporary property, push this down to the Identifier
+                table = expression.find(exp.Table)
+                if table and isinstance(table.this, exp.Identifier):
+                    table.this.set("temporary", True)
+
+            return f"{self.seg('INTO')} {self.sql(expression, 'this')}"
 
         def count_sql(self, expression: exp.Count) -> str:
             func_name = "COUNT_BIG" if expression.args.get("big_int") else "COUNT"
@@ -1232,20 +1319,6 @@ class TSQL(Dialect):
                 expression.this.set("catalog", None)
             return super().drop_sql(expression)
 
-        def declare_sql(self, expression: exp.Declare) -> str:
-            return f"DECLARE {self.expressions(expression, flat=True)}"
-
-        def declareitem_sql(self, expression: exp.DeclareItem) -> str:
-            variable = self.sql(expression, "this")
-            default = self.sql(expression, "default")
-            default = f" = {default}" if default else ""
-
-            kind = self.sql(expression, "kind")
-            if isinstance(expression.args.get("kind"), exp.Schema):
-                kind = f"TABLE {kind}"
-
-            return f"{variable} AS {kind}{default}"
-
         def options_modifier(self, expression: exp.Expression) -> str:
             options = self.expressions(expression, key="options")
             return f" OPTION{self.wrap(options)}" if options else ""
@@ -1254,3 +1327,14 @@ class TSQL(Dialect):
             return self.sql(
                 reduce(lambda x, y: exp.Add(this=x, expression=y), expression.flatten())
             )
+
+        def isascii_sql(self, expression: exp.IsAscii) -> str:
+            return f"(PATINDEX(CONVERT(VARCHAR(MAX), 0x255b5e002d7f5d25) COLLATE Latin1_General_BIN, {self.sql(expression.this)}) = 0)"
+
+        def columndef_sql(self, expression: exp.ColumnDef, sep: str = " ") -> str:
+            this = super().columndef_sql(expression, sep)
+            default = self.sql(expression, "default")
+            default = f" = {default}" if default else ""
+            output = self.sql(expression, "output")
+            output = f" {output}" if output else ""
+            return f"{this}{default}{output}"

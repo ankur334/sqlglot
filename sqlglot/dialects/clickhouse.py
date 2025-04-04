@@ -11,10 +11,12 @@ from sqlglot.dialects.dialect import (
     inline_array_sql,
     json_extract_segments,
     json_path_key_only_name,
+    length_or_char_length_sql,
     no_pivot_sql,
     build_json_extract_path,
     rename_func,
     sha256_sql,
+    strposition_sql,
     var_map_sql,
     timestamptrunc_sql,
     unit_to_var,
@@ -80,7 +82,7 @@ def _build_count_if(args: t.List) -> exp.CountIf | exp.CombinedAggFunc:
     if len(args) == 1:
         return exp.CountIf(this=seq_get(args, 0))
 
-    return exp.CombinedAggFunc(this="countIf", expressions=args, parts=("count", "If"))
+    return exp.CombinedAggFunc(this="countIf", expressions=args)
 
 
 def _build_str_to_date(args: t.List) -> exp.Cast | exp.Anonymous:
@@ -158,6 +160,26 @@ def _timestrtotime_sql(self: ClickHouse.Generator, expression: exp.TimeStrToTime
     return self.sql(exp.cast(ts, datatype, dialect=self.dialect))
 
 
+def _map_sql(self: ClickHouse.Generator, expression: exp.Map | exp.VarMap) -> str:
+    if not (expression.parent and expression.parent.arg_key == "settings"):
+        return _lower_func(var_map_sql(self, expression))
+
+    keys = expression.args.get("keys")
+    values = expression.args.get("values")
+
+    if not isinstance(keys, exp.Array) or not isinstance(values, exp.Array):
+        self.unsupported("Cannot convert array columns into map.")
+        return ""
+
+    args = []
+    for key, value in zip(keys.expressions, values.expressions):
+        args.append(f"{self.sql(key)}: {self.sql(value)}")
+
+    csv_args = ", ".join(args)
+
+    return f"{{{csv_args}}}"
+
+
 class ClickHouse(Dialect):
     NORMALIZE_FUNCTIONS: bool | str = False
     NULL_ORDERING = "nulls_are_last"
@@ -166,6 +188,9 @@ class ClickHouse(Dialect):
     LOG_BASE_FIRST: t.Optional[bool] = None
     FORCE_EARLY_ALIAS_REF_EXPANSION = True
     PRESERVE_ORIGINAL_NAMES = True
+    NUMBERS_CAN_BE_UNDERSCORE_SEPARATED = True
+    IDENTIFIERS_CAN_START_WITH_DIGIT = True
+    HEX_STRING_IS_INTEGER_TYPE = True
 
     # https://github.com/ClickHouse/ClickHouse/issues/33935#issue-1112165779
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
@@ -193,10 +218,12 @@ class ClickHouse(Dialect):
 
         KEYWORDS = {
             **tokens.Tokenizer.KEYWORDS,
+            ".:": TokenType.DOTCOLON,
             "ATTACH": TokenType.COMMAND,
             "DATE32": TokenType.DATE32,
             "DATETIME64": TokenType.DATETIME64,
             "DICTIONARY": TokenType.DICTIONARY,
+            "DYNAMIC": TokenType.DYNAMIC,
             "ENUM8": TokenType.ENUM8,
             "ENUM16": TokenType.ENUM16,
             "FINAL": TokenType.FINAL,
@@ -204,15 +231,12 @@ class ClickHouse(Dialect):
             "FLOAT32": TokenType.FLOAT,
             "FLOAT64": TokenType.DOUBLE,
             "GLOBAL": TokenType.GLOBAL,
-            "INT256": TokenType.INT256,
             "LOWCARDINALITY": TokenType.LOWCARDINALITY,
             "MAP": TokenType.MAP,
             "NESTED": TokenType.NESTED,
             "SAMPLE": TokenType.TABLE_SAMPLE,
             "TUPLE": TokenType.STRUCT,
-            "UINT128": TokenType.UINT128,
             "UINT16": TokenType.USMALLINT,
-            "UINT256": TokenType.UINT256,
             "UINT32": TokenType.UINT,
             "UINT64": TokenType.UBIGINT,
             "UINT8": TokenType.UTINYINT,
@@ -242,6 +266,7 @@ class ClickHouse(Dialect):
         # * select x from t1 union all (select x from t2 limit 1);
         MODIFIERS_ATTACHED_TO_SET_OP = False
         INTERVAL_SPANS = False
+        OPTIONAL_ALIAS_TOKEN_CTE = False
 
         FUNCTIONS = {
             **parser.Parser.FUNCTIONS,
@@ -259,6 +284,7 @@ class ClickHouse(Dialect):
             "JSONEXTRACTSTRING": build_json_extract_path(
                 exp.JSONExtractScalar, zero_based_indexing=False
             ),
+            "LENGTH": lambda args: exp.Length(this=seq_get(args, 0), binary=True),
             "MAP": parser.build_var_map,
             "MATCH": exp.RegexpLike.from_arg_list,
             "RANDCANONICAL": exp.Rand.from_arg_list,
@@ -414,6 +440,8 @@ class ClickHouse(Dialect):
 
         FUNC_TOKENS = {
             *parser.Parser.FUNC_TOKENS,
+            TokenType.AND,
+            TokenType.OR,
             TokenType.SET,
         }
 
@@ -442,6 +470,9 @@ class ClickHouse(Dialect):
 
         FUNCTION_PARSERS.pop("MATCH")
 
+        PROPERTY_PARSERS = parser.Parser.PROPERTY_PARSERS.copy()
+        PROPERTY_PARSERS.pop("DYNAMIC")
+
         NO_PAREN_FUNCTION_PARSERS = parser.Parser.NO_PAREN_FUNCTION_PARSERS.copy()
         NO_PAREN_FUNCTION_PARSERS.pop("ANY")
 
@@ -450,8 +481,7 @@ class ClickHouse(Dialect):
 
         RANGE_PARSERS = {
             **parser.Parser.RANGE_PARSERS,
-            TokenType.GLOBAL: lambda self, this: self._match(TokenType.IN)
-            and self._parse_in(this, is_global=True),
+            TokenType.GLOBAL: lambda self, this: self._parse_global_in(this),
         }
 
         # The PLACEHOLDER entry is popped because 1) it doesn't affect Clickhouse (it corresponds to
@@ -565,6 +595,8 @@ class ClickHouse(Dialect):
             Parse a placeholder expression like SELECT {abc: UInt32} or FROM {table: Identifier}
             https://clickhouse.com/docs/en/sql-reference/syntax#defining-and-using-query-parameters
             """
+            index = self._index
+
             this = self._parse_id_var()
             self._match(TokenType.COLON)
             kind = self._parse_types(check_func=False, allow_identifiers=False) or (
@@ -572,16 +604,44 @@ class ClickHouse(Dialect):
             )
 
             if not kind:
-                self.raise_error("Expecting a placeholder type or 'Identifier' for tables")
+                self._retreat(index)
+                return None
             elif not self._match(TokenType.R_BRACE):
                 self.raise_error("Expecting }")
 
+            if isinstance(this, exp.Identifier) and not this.quoted:
+                this = exp.var(this.name)
+
             return self.expression(exp.Placeholder, this=this, kind=kind)
+
+        def _parse_bracket(
+            self, this: t.Optional[exp.Expression] = None
+        ) -> t.Optional[exp.Expression]:
+            l_brace = self._match(TokenType.L_BRACE, advance=False)
+            bracket = super()._parse_bracket(this)
+
+            if l_brace and isinstance(bracket, exp.Struct):
+                varmap = exp.VarMap(keys=exp.Array(), values=exp.Array())
+                for expression in bracket.expressions:
+                    if not isinstance(expression, exp.PropertyEQ):
+                        break
+
+                    varmap.args["keys"].append("expressions", exp.Literal.string(expression.name))
+                    varmap.args["values"].append("expressions", expression.expression)
+
+                return varmap
+
+            return bracket
 
         def _parse_in(self, this: t.Optional[exp.Expression], is_global: bool = False) -> exp.In:
             this = super()._parse_in(this)
             this.set("is_global", is_global)
             return this
+
+        def _parse_global_in(self, this: t.Optional[exp.Expression]) -> exp.Not | exp.In:
+            is_negated = self._match(TokenType.NOT)
+            this = self._match(TokenType.IN) and self._parse_in(this, is_global=True)
+            return self.expression(exp.Not, this=this) if is_negated else this
 
         def _parse_table(
             self,
@@ -600,6 +660,13 @@ class ClickHouse(Dialect):
                 is_db_reference=is_db_reference,
             )
 
+            if isinstance(this, exp.Table):
+                inner = this.this
+                alias = this.args.get("alias")
+
+                if isinstance(inner, exp.GenerateSeries) and alias and not alias.columns:
+                    alias.set("columns", [exp.to_identifier("generate_series")])
+
             if self._match(TokenType.FINAL):
                 this = self.expression(exp.Final, this=this)
 
@@ -609,7 +676,7 @@ class ClickHouse(Dialect):
             return super()._parse_position(haystack_first=True)
 
         # https://clickhouse.com/docs/en/sql-reference/statements/select/with/
-        def _parse_cte(self) -> exp.CTE:
+        def _parse_cte(self) -> t.Optional[exp.CTE]:
             # WITH <identifier> AS <subquery expression>
             cte: t.Optional[exp.CTE] = self._try_parse(super()._parse_cte)
 
@@ -686,7 +753,6 @@ class ClickHouse(Dialect):
                     "expressions": anon_func.expressions,
                 }
                 if parts[1]:
-                    kwargs["parts"] = parts
                     exp_class: t.Type[exp.Expression] = (
                         exp.CombinedParameterizedAgg if params else exp.CombinedAggFunc
                     )
@@ -853,11 +919,11 @@ class ClickHouse(Dialect):
         TABLE_HINTS = False
         GROUPINGS_SEP = ""
         SET_OP_MODIFIERS = False
-        SUPPORTS_TABLE_ALIAS_COLUMNS = False
         VALUES_AS_TABLE = False
         ARRAY_SIZE_NAME = "LENGTH"
 
         STRING_TYPE_MAPPING = {
+            exp.DataType.Type.BLOB: "String",
             exp.DataType.Type.CHAR: "String",
             exp.DataType.Type.LONGBLOB: "String",
             exp.DataType.Type.LONGTEXT: "String",
@@ -926,12 +992,14 @@ class ClickHouse(Dialect):
             exp.DataType.Type.MULTIPOLYGON: "MultiPolygon",
             exp.DataType.Type.AGGREGATEFUNCTION: "AggregateFunction",
             exp.DataType.Type.SIMPLEAGGREGATEFUNCTION: "SimpleAggregateFunction",
+            exp.DataType.Type.DYNAMIC: "Dynamic",
         }
 
         TRANSFORMS = {
             **generator.Generator.TRANSFORMS,
             exp.AnyValue: rename_func("any"),
             exp.ApproxDistinct: rename_func("uniq"),
+            exp.ArrayConcat: rename_func("arrayConcat"),
             exp.ArrayFilter: lambda self, e: self.func("arrayFilter", e.expression, e.this),
             exp.ArraySum: rename_func("arraySum"),
             exp.ArgMax: arg_max_or_min_no_count("argMax"),
@@ -951,11 +1019,13 @@ class ClickHouse(Dialect):
             exp.Explode: rename_func("arrayJoin"),
             exp.Final: lambda self, e: f"{self.sql(e, 'this')} FINAL",
             exp.IsNan: rename_func("isNaN"),
+            exp.JSONCast: lambda self, e: f"{self.sql(e, 'this')}.:{self.sql(e, 'to')}",
             exp.JSONExtract: json_extract_segments("JSONExtractString", quoted_index=False),
             exp.JSONExtractScalar: json_extract_segments("JSONExtractString", quoted_index=False),
             exp.JSONPathKey: json_path_key_only_name,
             exp.JSONPathRoot: lambda *_: "",
-            exp.Map: lambda self, e: _lower_func(var_map_sql(self, e)),
+            exp.Length: length_or_char_length_sql,
+            exp.Map: _map_sql,
             exp.Median: rename_func("median"),
             exp.Nullif: rename_func("nullIf"),
             exp.PartitionedByProperty: lambda self, e: f"PARTITION BY {self.sql(e, 'this')}",
@@ -964,8 +1034,12 @@ class ClickHouse(Dialect):
             exp.RegexpLike: lambda self, e: self.func("match", e.this, e.expression),
             exp.Rand: rename_func("randCanonical"),
             exp.StartsWith: rename_func("startsWith"),
-            exp.StrPosition: lambda self, e: self.func(
-                "position", e.this, e.args.get("substr"), e.args.get("position")
+            exp.StrPosition: lambda self, e: strposition_sql(
+                self,
+                e,
+                func_name="POSITION",
+                supports_position=True,
+                use_ansi_position=False,
             ),
             exp.TimeToStr: lambda self, e: self.func(
                 "formatDateTime", e.this, self.format_time(e), e.args.get("zone")
@@ -973,7 +1047,7 @@ class ClickHouse(Dialect):
             exp.TimeStrToTime: _timestrtotime_sql,
             exp.TimestampAdd: _datetime_delta_sql("TIMESTAMP_ADD"),
             exp.TimestampSub: _datetime_delta_sql("TIMESTAMP_SUB"),
-            exp.VarMap: lambda self, e: _lower_func(var_map_sql(self, e)),
+            exp.VarMap: _map_sql,
             exp.Xor: lambda self, e: self.func("xor", e.this, e.expression, *e.expressions),
             exp.MD5Digest: rename_func("MD5"),
             exp.MD5: lambda self, e: self.func("LOWER", self.func("HEX", self.func("MD5", e.this))),
@@ -981,7 +1055,7 @@ class ClickHouse(Dialect):
             exp.SHA2: sha256_sql,
             exp.UnixToTime: _unix_to_time_sql,
             exp.TimestampTrunc: timestamptrunc_sql(zone=True),
-            exp.Trim: trim_sql,
+            exp.Trim: lambda self, e: trim_sql(self, e, default_trim_type="BOTH"),
             exp.Variance: rename_func("varSamp"),
             exp.SchemaCommentProperty: lambda self, e: self.naked_property(e),
             exp.Stddev: rename_func("stddevSamp"),
@@ -1037,7 +1111,7 @@ class ClickHouse(Dialect):
             if not isinstance(expression.parent, exp.Cast):
                 # StrToDate returns DATEs in other dialects (eg. postgres), so
                 # this branch aims to improve the transpilation to clickhouse
-                return f"CAST({strtodate_sql} AS DATE)"
+                return self.cast_sql(exp.cast(expression, "DATE"))
 
             return strtodate_sql
 
@@ -1146,19 +1220,6 @@ class ClickHouse(Dialect):
                 ),
             ]
 
-        def parameterizedagg_sql(self, expression: exp.ParameterizedAgg) -> str:
-            params = self.expressions(expression, key="params", flat=True)
-            return self.func(expression.name, *expression.expressions) + f"({params})"
-
-        def anonymousaggfunc_sql(self, expression: exp.AnonymousAggFunc) -> str:
-            return self.func(expression.name, *expression.expressions)
-
-        def combinedaggfunc_sql(self, expression: exp.CombinedAggFunc) -> str:
-            return self.anonymousaggfunc_sql(expression)
-
-        def combinedparameterizedagg_sql(self, expression: exp.CombinedParameterizedAgg) -> str:
-            return self.parameterizedagg_sql(expression)
-
         def placeholder_sql(self, expression: exp.Placeholder) -> str:
             return f"{{{expression.name}: {self.sql(expression, 'kind')}}}"
 
@@ -1239,3 +1300,18 @@ class ClickHouse(Dialect):
                 is_sql = self.wrap(is_sql)
 
             return is_sql
+
+        def in_sql(self, expression: exp.In) -> str:
+            in_sql = super().in_sql(expression)
+
+            if isinstance(expression.parent, exp.Not) and expression.args.get("is_global"):
+                in_sql = in_sql.replace("GLOBAL IN", "GLOBAL NOT IN", 1)
+
+            return in_sql
+
+        def not_sql(self, expression: exp.Not) -> str:
+            if isinstance(expression.this, exp.In) and expression.this.args.get("is_global"):
+                # let `GLOBAL IN` child interpose `NOT`
+                return self.sql(expression, "this")
+
+            return super().not_sql(expression)

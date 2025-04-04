@@ -117,7 +117,7 @@ def simplify(
         node = flatten(node)
         node = simplify_connectors(node, root)
         node = remove_complements(node, root)
-        node = simplify_coalesce(node)
+        node = simplify_coalesce(node, dialect)
         node.parent = expression.parent
         node = simplify_literals(node, root)
         node = simplify_equality(node)
@@ -749,7 +749,7 @@ def simplify_parens(expression):
 
     if (
         not isinstance(this, exp.Select)
-        and not isinstance(parent, exp.SubqueryPredicate)
+        and not isinstance(parent, (exp.SubqueryPredicate, exp.Bracket))
         and (
             not isinstance(parent, (exp.Condition, exp.Binary))
             or isinstance(parent, exp.Paren)
@@ -775,7 +775,7 @@ def _is_constant(expression: exp.Expression) -> bool:
     return isinstance(expression, exp.CONSTANTS) or _is_date_literal(expression)
 
 
-def simplify_coalesce(expression):
+def simplify_coalesce(expression: exp.Expression, dialect: DialectType) -> exp.Expression:
     # COALESCE(x) -> x
     if (
         isinstance(expression, exp.Coalesce)
@@ -784,6 +784,12 @@ def simplify_coalesce(expression):
         and not isinstance(expression.parent, exp.Hint)
     ):
         return expression.this
+
+    # We can't convert `COALESCE(x, 1) = 2` into `NOT x IS NULL AND x = 2` for redshift,
+    # because they are not always equivalent. For example,  if `x` is `NULL` and it comes
+    # from a table, then the result is `NULL`, despite `FALSE AND NULL` evaluating to `FALSE`
+    if dialect == "redshift":
+        return expression
 
     if not isinstance(expression, COMPARISONS):
         return expression
@@ -1328,13 +1334,17 @@ def _flat_simplify(expression, simplifier, root=True):
     return expression
 
 
-def gen(expression: t.Any) -> str:
+def gen(expression: t.Any, comments: bool = False) -> str:
     """Simple pseudo sql generator for quickly generating sortable and uniq strings.
 
     Sorting and deduping sql is a necessary step for optimization. Calling the actual
     generator is expensive so we have a bare minimum sql generator here.
+
+    Args:
+        expression: the expression to convert into a SQL string.
+        comments: whether to include the expression's comments.
     """
-    return Gen().gen(expression)
+    return Gen().gen(expression, comments=comments)
 
 
 class Gen:
@@ -1342,7 +1352,7 @@ class Gen:
         self.stack = []
         self.sqls = []
 
-    def gen(self, expression: exp.Expression) -> str:
+    def gen(self, expression: exp.Expression, comments: bool = False) -> str:
         self.stack = [expression]
         self.sqls.clear()
 
@@ -1350,6 +1360,9 @@ class Gen:
             node = self.stack.pop()
 
             if isinstance(node, exp.Expression):
+                if comments and node.comments:
+                    self.stack.append(f" /*{','.join(node.comments)}*/")
+
                 exp_handler_name = f"{node.key}_sql"
 
                 if hasattr(self, exp_handler_name):
